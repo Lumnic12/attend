@@ -1,0 +1,698 @@
+from flask import Flask, request
+import face_recognition
+import cv2
+import os
+import openpyxl
+from datetime import datetime
+import numpy as np
+
+# ========== CONFIG ==========
+USER_FILE = "authorized_users.csv"
+EXCEL_FILE = "Book3.xlsx"
+KNOWN_FACES_DIR = "known_faces"
+
+# ========== GLOBALS ==========
+known_face_encodings = []
+known_face_names = []
+card_to_name = {}
+
+app = Flask(__name__)
+
+# ---------- Load data ----------
+def load_faces():
+    global known_face_encodings, known_face_names
+    known_face_encodings.clear()
+    known_face_names.clear()
+    for filename in os.listdir(KNOWN_FACES_DIR):
+        if filename.endswith(".jpg"):
+            path = os.path.join(KNOWN_FACES_DIR, filename)
+            img = face_recognition.load_image_file(path)
+            enc = face_recognition.face_encodings(img)
+            if enc:
+                known_face_encodings.append(enc[0])
+                known_face_names.append(filename.split(".")[0])
+            else:
+                print(f"[WARN] No face in {filename}")
+
+def load_user_records():
+    global card_to_name
+    card_to_name = {}
+    if os.path.exists(USER_FILE):
+        with open(USER_FILE, "r") as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) == 2:
+                    card_id, name = parts
+                    card_to_name[card_id] = name
+
+def save_to_excel(name, card_id, status):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        wb = openpyxl.load_workbook(EXCEL_FILE)
+    except FileNotFoundError:
+        wb = openpyxl.Workbook()
+    sheet = wb.active
+    if sheet.max_row == 1:
+        sheet.append(["Timestamp", "Card ID", "Name", "Status"])
+    sheet.append([now, card_id, name, status])
+    wb.save(EXCEL_FILE)
+
+def rotate_image(image, angle):
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(image, matrix, (w, h))
+
+# ---------- Main API ----------
+@app.route("/api/rfid")
+def rfid_api():
+    card_id = request.args.get("uid", "").strip()
+    if not card_id:
+        return "BAD_REQUEST", 400
+    print(f"[RFID] Card detected: {card_id}")
+
+    if card_id not in card_to_name:
+        print("❌ Unauthorized card")
+        save_to_excel("Unknown", card_id, "Unauthorized")
+        return "UNAUTH"
+
+    expected_name = card_to_name[card_id]
+    print(f"[INFO] Expected: {expected_name}")
+    cap = cv2.VideoCapture(0)
+    matched = False
+    matched_name = "Unknown"
+
+    for _ in range(3):
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        rgb_frame = frame[:, :, ::-1]
+
+        for angle in [0, -15, 15, -30, 30]:
+            rotated = rotate_image(rgb_frame, angle)
+            face_locations = face_recognition.face_locations(rotated)
+            face_encodings = face_recognition.face_encodings(rotated, face_locations)
+
+            for face_encoding in face_encodings:
+                distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+                if len(distances) == 0:
+                    continue
+                best_idx = np.argmin(distances)
+                if distances[best_idx] < 0.55:
+                    matched_name = known_face_names[best_idx]
+                    if matched_name == expected_name:
+                        matched = True
+                        break
+            if matched:
+                break
+        if matched:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    if matched:
+        print(f"✅ Match: {matched_name}")
+        save_to_excel(matched_name, card_id, "Authorized")
+        return "FACE_OK"
+    else:
+        print("❌ Face not matched")
+        save_to_excel("Unknown", card_id, "Face Not Match")
+        return "FACE_FAIL"
+
+# ---------- Run ----------
+if __name__ == "__main__":
+    load_faces()
+    load_user_records()
+    print("✅ Server running at http://0.0.0.0:5000")
+    app.run(host="0.0.0.0", port=5000)
+
+
+
+
+2nd
+
+
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+from PIL import Image, ImageTk
+import face_recognition
+import cv2
+import os
+import time
+import numpy as np
+import openpyxl
+from datetime import datetime
+import threading
+from flask import Flask, request
+from werkzeug.serving import make_server
+
+# ========== CONFIG ==========
+USER_FILE = "authorized_users.csv"
+EXCEL_FILE = "Book3.xlsx"
+KNOWN_FACES_DIR = "known_faces"
+HOST = "0.0.0.0"  # your PC's IP will be used by ESP to connect
+PORT = 5000
+
+# ========== GLOBALS ==========
+known_face_encodings = []
+known_face_names = []
+card_to_name = {}
+app = Flask(__name__)
+server_thread = None
+
+# ========== GUI SETUP ==========
+root = tk.Tk()
+root.title("RFID + Face Recognition Attendance (Wi-Fi)")
+root.geometry("900x650")
+root.configure(bg="#f0f2f5")
+
+style = ttk.Style()
+style.configure("TButton", font=("Segoe UI", 12), padding=6)
+style.configure("TLabel", font=("Segoe UI", 12))
+style.configure("TEntry", font=("Segoe UI", 12))
+
+log_text = tk.Text(root, height=15, width=105, font=("Courier New", 10))
+log_text.pack(pady=10)
+
+canvas = tk.Canvas(root, width=200, height=200, bg="white", bd=2, relief="groove")
+canvas.pack(pady=10)
+
+status_label = tk.Label(root, text="", font=("Segoe UI", 14, "bold"), bg="#f0f2f5")
+status_label.pack()
+
+# ========== UTILS ==========
+def append_log(entry):
+    log_text.insert(tk.END, entry + "\n")
+    log_text.see(tk.END)
+
+def load_faces():
+    known_face_encodings.clear()
+    known_face_names.clear()
+    if not os.path.exists(KNOWN_FACES_DIR):
+        os.makedirs(KNOWN_FACES_DIR)
+    for filename in os.listdir(KNOWN_FACES_DIR):
+        if filename.endswith(".jpg"):
+            path = os.path.join(KNOWN_FACES_DIR, filename)
+            img = face_recognition.load_image_file(path)
+            enc = face_recognition.face_encodings(img)
+            if enc:
+                known_face_encodings.append(enc[0])
+                known_face_names.append(filename.split(".")[0])
+            else:
+                print(f"[WARN] No face in {filename}")
+
+def load_user_records():
+    global card_to_name
+    card_to_name = {}
+    if os.path.exists(USER_FILE):
+        with open(USER_FILE, "r") as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) == 2:
+                    card_id, name = parts
+                    card_to_name[card_id] = name
+
+def save_to_excel(name, card_id, status):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        wb = openpyxl.load_workbook(EXCEL_FILE)
+    except FileNotFoundError:
+        wb = openpyxl.Workbook()
+    sheet = wb.active
+    if sheet.max_row == 1:
+        sheet.append(["Timestamp", "Card ID", "Name", "Status"])
+    sheet.append([now, card_id, name, status])
+    wb.save(EXCEL_FILE)
+
+def show_image(img_path):
+    img = Image.open(img_path)
+    img = img.resize((200, 200))
+    img_tk = ImageTk.PhotoImage(img)
+    canvas.create_image(0, 0, anchor=tk.NW, image=img_tk)
+    canvas.image = img_tk
+
+def rotate_image(image, angle):
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(image, matrix, (w, h))
+
+# ========== FACE HANDLER ==========
+def handle_card(card_id):
+    if card_id not in card_to_name:
+        append_log("❌ Unauthorized card")
+        save_to_excel("Unknown", card_id, "Unauthorized")
+        status_label.config(text="Unauthorized Card", fg="red")
+        return "UNAUTH"
+
+    expected_name = card_to_name[card_id]
+    append_log(f"[INFO] Expected: {expected_name}")
+    cap = cv2.VideoCapture(0)
+    matched = False
+    matched_name = "Unknown"
+    frame_to_show = None
+
+    for _ in range(3):
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        rgb_frame = frame[:, :, ::-1]
+
+        for angle in [0, -15, 15, -30, 30]:
+            rotated = rotate_image(rgb_frame, angle)
+            face_locations = face_recognition.face_locations(rotated)
+            face_encodings = face_recognition.face_encodings(rotated, face_locations)
+
+            for face_encoding in face_encodings:
+                distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+                if len(distances) == 0:
+                    continue
+                best_idx = np.argmin(distances)
+                if distances[best_idx] < 0.55:
+                    matched_name = known_face_names[best_idx]
+                    if matched_name == expected_name:
+                        matched = True
+                        frame_to_show = frame
+                        break
+            if matched:
+                break
+        if matched:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    if matched:
+        append_log(f"✅ Match: {matched_name}")
+        save_to_excel(matched_name, card_id, "Authorized")
+        cv2.imwrite("temp.jpg", frame_to_show)
+        show_image("temp.jpg")
+        status_label.config(text=f"Access Granted: {matched_name}", fg="green")
+        return "FACE_OK"
+    else:
+        append_log("❌ Face not matched")
+        save_to_excel("Unknown", card_id, "Face Not Match")
+        status_label.config(text="Access Denied: Face Not Matched", fg="red")
+        return "FACE_FAIL"
+
+# ========== FLASK SERVER ==========
+@app.route("/api/rfid")
+def rfid_api():
+    card_id = request.args.get("uid", "").strip()
+    if not card_id:
+        return "BAD_REQUEST", 400
+    append_log(f"[RFID] Card Detected: {card_id}")
+    result = handle_card(card_id)
+    return result
+
+# ========== REGISTER USER ==========
+def register_user():
+    def start_camera():
+        def update_frame():
+            ret, frame = cap.read()
+            if ret:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(frame_rgb)
+                img = img.resize((300, 300))
+                imgtk = ImageTk.PhotoImage(image=img)
+                cam_label.imgtk = imgtk
+                cam_label.configure(image=imgtk)
+            cam_label.after(10, update_frame)
+        update_frame()
+
+    def capture_photo():
+        name = name_entry.get().strip()
+        card_id = card_entry.get().strip()
+        if not name or not card_id:
+            messagebox.showwarning("Missing Info", "Please enter both name and card ID.")
+            return
+
+        ret, frame = cap.read()
+        if ret:
+            filename = os.path.join(KNOWN_FACES_DIR, f"{name}.jpg")
+            cv2.imwrite(filename, frame)
+            with open(USER_FILE, "a") as f:
+                f.write(f"{card_id},{name}\n")
+            messagebox.showinfo("Success", f"User {name} registered successfully!")
+            load_faces()
+            load_user_records()
+            reg_window.destroy()
+        else:
+            messagebox.showerror("Capture Failed", "Unable to capture image from webcam.")
+
+    reg_window = tk.Toplevel(root)
+    reg_window.title("Register New User")
+    reg_window.geometry("400x500")
+    reg_window.resizable(False, False)
+
+    ttk.Label(reg_window, text="Register New User", font=("Segoe UI", 16, "bold")).pack(pady=10)
+
+    form_frame = ttk.Frame(reg_window)
+    form_frame.pack(pady=10)
+
+    ttk.Label(form_frame, text="Name:").grid(row=0, column=0, sticky="e")
+    name_entry = ttk.Entry(form_frame, width=30)
+    name_entry.grid(row=0, column=1, pady=5)
+
+    ttk.Label(form_frame, text="Card ID:").grid(row=1, column=0, sticky="e")
+    card_entry = ttk.Entry(form_frame, width=30)
+    card_entry.grid(row=1, column=1, pady=5)
+
+    cam_label = tk.Label(reg_window, bg="gray", width=300, height=300)
+    cam_label.pack(pady=10)
+
+    ttk.Button(reg_window, text="Capture & Register", command=capture_photo).pack(pady=10)
+
+    cap = cv2.VideoCapture(0)
+    start_camera()
+
+    def on_close():
+        cap.release()
+        reg_window.destroy()
+
+    reg_window.protocol("WM_DELETE_WINDOW", on_close)
+
+# ========== SERVER THREAD ==========
+class FlaskThread(threading.Thread):
+    def run(self):
+        server = make_server(HOST, PORT, app)
+        server.serve_forever()
+
+# ========== GUI CONTROLS ==========
+btn_frame = tk.Frame(root, bg="#f0f2f5")
+btn_frame.pack(pady=10)
+
+ttk.Button(btn_frame, text="Register New User", command=register_user).grid(row=0, column=0, padx=10)
+ttk.Button(btn_frame, text="Quit", command=root.quit).grid(row=0, column=1, padx=10)
+
+# ========== START ==========
+load_faces()
+load_user_records()
+append_log("✅ System Ready. Waiting for RFID scan via Wi-Fi...")
+append_log(f"🌐 Connect your ESP to: http://<your_pc_ip>:{PORT}/api/rfid?uid=<card_id>")
+
+server_thread = FlaskThread()
+server_thread.daemon = True
+server_thread.start()
+
+root.mainloop()
+
+
+3rd
+
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+from PIL import Image, ImageTk
+import face_recognition
+import cv2
+import os
+import time
+import numpy as np
+import openpyxl
+from datetime import datetime
+import threading
+from flask import Flask, request
+from werkzeug.serving import make_server
+import queue
+
+# ========== CONFIG ==========
+USER_FILE = "authorized_users.csv"
+EXCEL_FILE = "Book3.xlsx"
+KNOWN_FACES_DIR = "known_faces"
+HOST = "0.0.0.0"
+PORT = 5000
+
+# ========== GLOBALS ==========
+known_face_encodings = []
+known_face_names = []
+card_to_name = {}
+app = Flask(__name__)
+server_thread = None
+
+# Queue for safe communication between Flask thread and Tkinter main thread
+request_queue = queue.Queue()
+pending_results = {}  # card_id -> {"event": Event, "result": str}
+
+# ========== GUI SETUP ==========
+root = tk.Tk()
+root.title("RFID + Face Recognition Attendance (Wi-Fi)")
+root.geometry("900x650")
+root.configure(bg="#64ccc3")
+
+style = ttk.Style()
+style.configure("TButton", font=("Segoe UI", 12), padding=6)
+style.configure("TLabel", font=("Segoe UI", 12))
+style.configure("TEntry", font=("Segoe UI", 12))
+
+log_text = tk.Text(root, height=15, width=105, font=("Courier New", 10))
+log_text.pack(pady=10)
+
+canvas = tk.Canvas(root, width=200, height=200, bg="#5cbba3", bd=2, relief="groove")
+canvas.pack(pady=10)
+
+status_label = tk.Label(root, text="", font=("Segoe UI", 14, "bold"), bg="#1eddad")
+status_label.pack()
+
+# ========== UTILS ==========
+def append_log(entry):
+    log_text.insert(tk.END, entry + "\n")
+    log_text.see(tk.END)
+
+def load_faces():
+    known_face_encodings.clear()
+    known_face_names.clear()
+    if not os.path.exists(KNOWN_FACES_DIR):
+        os.makedirs(KNOWN_FACES_DIR)
+    for filename in os.listdir(KNOWN_FACES_DIR):
+        if filename.endswith(".jpg"):
+            path = os.path.join(KNOWN_FACES_DIR, filename)
+            img = face_recognition.load_image_file(path)
+            enc = face_recognition.face_encodings(img)
+            if enc:
+                known_face_encodings.append(enc[0])
+                known_face_names.append(filename.split(".")[0])
+            else:
+                print(f"[WARN] No face in {KNOWN_FACES_DIR}")
+
+def load_user_records():
+    global card_to_name
+    card_to_name = {}
+    if os.path.exists(USER_FILE):
+        with open(USER_FILE, "r") as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) == 2:
+                    card_id, name = parts
+                    card_to_name[card_id] = name
+
+def save_to_excel(name, card_id, status):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        wb = openpyxl.load_workbook(EXCEL_FILE)
+    except FileNotFoundError:
+        wb = openpyxl.Workbook()
+    sheet = wb.active
+    if sheet.max_row == 1:
+        sheet.append(["Timestamp", "Card ID", "Name", "Status"])
+    sheet.append([now, card_id, name, status])
+    wb.save(EXCEL_FILE)
+
+def show_image(img_path):
+    img = Image.open(img_path)
+    img = img.resize((200, 200))
+    img_tk = ImageTk.PhotoImage(img)
+    canvas.create_image(0, 0, anchor=tk.NW, image=img_tk)
+    canvas.image = img_tk
+
+def rotate_image(image, angle):
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(image, matrix, (w, h))
+
+# ========== FACE HANDLER ==========
+def handle_card(card_id):
+    if card_id not in card_to_name:
+        append_log("❌ Unauthorized card")
+        save_to_excel("Unknown", card_id, "Unauthorized")
+        status_label.config(text="Unauthorized Card", fg="red")
+        return "UNAUTH"
+
+    expected_name = card_to_name[card_id]
+    append_log(f"[INFO] Expected: {expected_name}")
+    cap = cv2.VideoCapture(0)
+    matched = False
+    matched_name = "Unknown"
+    frame_to_show = None
+
+    for _ in range(3):
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        rgb_frame = frame[:, :, ::-1]
+
+        for angle in [0, -15, 15, -30, 30]:
+            rotated = rotate_image(rgb_frame, angle)
+            face_locations = face_recognition.face_locations(rotated)
+            face_encodings = face_recognition.face_encodings(rotated, face_locations)
+
+            for face_encoding in face_encodings:
+                distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+                if len(distances) == 0:
+                    continue
+                best_idx = np.argmin(distances)
+                if distances[best_idx] < 0.55:
+                    matched_name = known_face_names[best_idx]
+                    if matched_name == expected_name:
+                        matched = True
+                        frame_to_show = frame
+                        break
+            if matched:
+                break
+        if matched:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    if matched:
+        append_log(f"✅ Match: {matched_name}")
+        save_to_excel(matched_name, card_id, "Authorized")
+        cv2.imwrite("temp.jpg", frame_to_show)
+        show_image("temp.jpg")
+        status_label.config(text=f"Access Granted: {matched_name}", fg="green")
+        return "FACE_OK"
+    else:
+        append_log("❌ Face not matched")
+        save_to_excel("Unknown", card_id, "Face Not Match")
+        status_label.config(text="Access Denied: Face Not Matched", fg="red")
+        return "FACE_FAIL"
+
+# ========== FLASK SERVER ==========
+@app.route("/api/rfid")
+def rfid_api():
+    card_id = request.args.get("uid", "").strip()
+    if not card_id:
+        return "BAD_REQUEST", 400
+
+    append_log(f"[RFID] Card Detected: {card_id}")
+    evt = threading.Event()
+    pending_results[card_id] = {"event": evt, "result": None}
+    request_queue.put(card_id)
+
+    # wait up to 10 seconds for main thread processing
+    processed = evt.wait(timeout=10)
+    if processed:
+        res = pending_results[card_id]["result"]
+        del pending_results[card_id]
+        return res
+    else:
+        del pending_results[card_id]
+        append_log(f"[ERROR] Processing timeout for {card_id}")
+        return "TIMEOUT", 504
+
+# ========== QUEUE POLLING ==========
+def poll_queue():
+    try:
+        card_id = request_queue.get_nowait()
+    except queue.Empty:
+        root.after(200, poll_queue)
+        return
+
+    append_log(f"[QUEUE] Processing card: {card_id}")
+    result = handle_card(card_id)
+
+    entry = pending_results.get(card_id)
+    if entry:
+        entry["result"] = result
+        entry["event"].set()
+
+    root.after(200, poll_queue)
+
+# ========== REGISTER USER ==========
+def register_user():
+    def start_camera():
+        def update_frame():
+            ret, frame = cap.read()
+            if ret:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(frame_rgb)
+                img = img.resize((300, 300))
+                imgtk = ImageTk.PhotoImage(image=img)
+                cam_label.imgtk = imgtk
+                cam_label.configure(image=imgtk)
+            cam_label.after(10, update_frame)
+        update_frame()
+
+    def capture_photo():
+        name = name_entry.get().strip()
+        card_id = card_entry.get().strip()
+        if not name or not card_id:
+            messagebox.showwarning("Missing Info", "Please enter both name and card ID.")
+            return
+
+        ret, frame = cap.read()
+        if ret:
+            filename = os.path.join(KNOWN_FACES_DIR, f"{name}.jpg")
+            cv2.imwrite(filename, frame)
+            with open(USER_FILE, "a") as f:
+                f.write(f"{card_id},{name}\n")
+            messagebox.showinfo("Success", f"User {name} registered successfully!")
+            load_faces()
+            load_user_records()
+            reg_window.destroy()
+        else:
+            messagebox.showerror("Capture Failed", "Unable to capture image from webcam.")
+
+    reg_window = tk.Toplevel(root)
+    reg_window.title("Register New User")
+    reg_window.geometry("400x500")
+    reg_window.resizable(False, False)
+
+    ttk.Label(reg_window, text="Register New User", font=("Segoe UI", 16, "bold")).pack(pady=10)
+    form_frame = ttk.Frame(reg_window)
+    form_frame.pack(pady=10)
+    ttk.Label(form_frame, text="Name:").grid(row=0, column=0, sticky="e")
+    name_entry = ttk.Entry(form_frame, width=30)
+    name_entry.grid(row=0, column=1, pady=5)
+    ttk.Label(form_frame, text="Card ID:").grid(row=1, column=0, sticky="e")
+    card_entry = ttk.Entry(form_frame, width=30)
+    card_entry.grid(row=1, column=1, pady=5)
+    cam_label = tk.Label(reg_window, bg="gray", width=300, height=300)
+    cam_label.pack(pady=10)
+    ttk.Button(reg_window, text="Capture & Register", command=capture_photo).pack(pady=10)
+
+    cap = cv2.VideoCapture(0)
+    start_camera()
+    def on_close():
+        cap.release()
+        reg_window.destroy()
+    reg_window.protocol("WM_DELETE_WINDOW", on_close)
+
+# ========== SERVER THREAD ==========
+class FlaskThread(threading.Thread):
+    def run(self):
+        server = make_server(HOST, PORT, app)
+        server.serve_forever()
+
+# ========== GUI CONTROLS ==========
+btn_frame = tk.Frame(root, bg="#f0f2f5")
+btn_frame.pack(pady=10)
+ttk.Button(btn_frame, text="Register New User", command=register_user).grid(row=0, column=0, padx=10)
+ttk.Button(btn_frame, text="Quit", command=root.quit).grid(row=0, column=1, padx=10)
+
+# ========== START ==========
+load_faces()
+load_user_records()
+append_log("✅ System Ready. Waiting for RFID scan via Wi-Fi...")
+append_log(f"🌐 Connect your ESP to: http://<your_pc_ip>:{PORT}/api/rfid?uid=<card_id>")
+
+server_thread = FlaskThread()
+server_thread.daemon = True
+server_thread.start()
+
+root.after(200, poll_queue)
+root.mainloop()
